@@ -2,28 +2,20 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"github.com/spf13/cobra"
-	"log"
+	"github.com/mattn/go-tty"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"github.com/mattn/go-tty"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/status"
-
-	pb "cli-client/auth"
+	"github.com/spf13/cobra"
 )
 
-const (
-	address   = "localhost:50051"
-	tokenFile = "go-client-token"
-)
-
-var tokenFilePath = filepath.Join(os.TempDir(), tokenFile)
+var username, password, message string
+var tokenFilePath = filepath.Join(os.TempDir(), "go-client-token")
 
 func readPassword() (string, error) {
 	tty, err := tty.Open()
@@ -45,14 +37,112 @@ func readPassword() (string, error) {
 	}
 	return password.String(), nil
 }
+func main() {
+	var rootCmd = &cobra.Command{Use: "go-client"}
 
-func saveTokenToFile(token string) error {
-	file, err := os.Create(tokenFilePath)
+	var loginCmd = &cobra.Command{
+		Use:   "login",
+		Short: "Login with username and password",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Print("Enter password: ")
+			pass, err := readPassword()
+			if err != nil {
+				fmt.Println("Error reading password:", err)
+				return
+			}
+			password = strings.TrimSpace(pass)
+			err = login(username, password)
+			if err != nil {
+				fmt.Println("\nLogin failed:", err)
+			}
+		},
+	}
+
+	loginCmd.Flags().StringVarP(&username, "username", "u", "", "Username")
+	loginCmd.MarkFlagRequired("username")
+
+	var runCmd = &cobra.Command{
+		Use:   "run",
+		Short: "Send message to server",
+		Run: func(cmd *cobra.Command, args []string) {
+			token, err := readTokenFromFile()
+			if err != nil {
+				fmt.Println("You must login first:", err)
+				return
+			}
+			err = sendMessageToServer(token, message)
+			if err != nil {
+				fmt.Println("Error:", err)
+			}
+		},
+	}
+
+	runCmd.Flags().StringVarP(&message, "name", "n", "", "Message to send")
+	runCmd.MarkFlagRequired("name")
+
+	rootCmd.AddCommand(loginCmd, runCmd)
+	rootCmd.Execute()
+}
+
+func login(username, password string) error {
+	url := "http://localhost:8080/login"
+	loginReq := map[string]string{"username": username, "password": password}
+	jsonData, err := json.Marshal(loginReq)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("login failed with status: %s", resp.Status)
+	}
+
+	var loginResp map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&loginResp); err != nil {
+		return err
+	}
+
+	fmt.Printf("\n%s\n", loginResp["message"])
+
+	token := loginResp["token"]
+
+	return saveTokenToFile(token)
+}
+
+func sendMessageToServer(token, message string) error {
+	url := "http://localhost:8080/log"
+	msgReq := map[string]string{"token": token, "message": message}
+	jsonData, err := json.Marshal(msgReq)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to send message: %s", resp.Status)
+	}
+
+	return nil
+}
+
+func saveTokenToFile(token string) error {
+
+	file, err := os.OpenFile(tokenFilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
 	result := []byte(token + "\n")
+	defer file.Close()
 
 	_, err = file.WriteString(string(result))
 	return err
@@ -72,86 +162,4 @@ func readTokenFromFile() (string, error) {
 	}
 
 	return strings.TrimSpace(token), nil
-}
-
-func login(client pb.AuthServiceClient, username, password string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	resp, err := client.Login(ctx, &pb.LoginRequest{Username: username, Password: password})
-	if err != nil {
-		return err
-	}
-	fmt.Printf("\n%s\n", resp.Message)
-	return saveTokenToFile(resp.GetToken())
-}
-
-func sendMessage(client pb.AuthServiceClient, token, message string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	resp, err := client.SendMessage(ctx, &pb.MessageRequest{Token: token, Message: message})
-	if err != nil {
-		st, _ := status.FromError(err)
-		return fmt.Errorf("error: %v", st.Message())
-	}
-	fmt.Println(resp.GetResponse())
-	return nil
-}
-
-func main() {
-	conn, err := grpc.Dial(address, grpc.WithInsecure())
-	if err != nil {
-		log.Fatalf("did not connect: %v", err)
-	}
-	defer conn.Close()
-
-	client := pb.NewAuthServiceClient(conn)
-
-	var rootCmd = &cobra.Command{Use: "go-client"}
-
-	var username, password, message string
-
-	var loginCmd = &cobra.Command{
-		Use:   "login",
-		Short: "Login with username and password",
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Print("Enter password: ")
-			pass, err := readPassword()
-			if err != nil {
-				fmt.Println("Error reading password:", err)
-				return
-			}
-			password = strings.TrimSpace(pass)
-			err = login(client, username, password)
-			if err != nil {
-				fmt.Println("Login failed:", err)
-			}
-		},
-	}
-
-	loginCmd.Flags().StringVarP(&username, "username", "u", "", "Username")
-	loginCmd.MarkFlagRequired("username")
-
-	var runCmd = &cobra.Command{
-		Use:   "run",
-		Short: "Send message to server",
-		Run: func(cmd *cobra.Command, args []string) {
-			token, err := readTokenFromFile()
-			if err != nil {
-				fmt.Println("You must login first:", err)
-				return
-			}
-			err = sendMessage(client, token, message)
-			if err != nil {
-				fmt.Println("Error:", err)
-			}
-		},
-	}
-
-	runCmd.Flags().StringVarP(&message, "name", "n", "", "Message to send")
-	runCmd.MarkFlagRequired("name")
-
-	rootCmd.AddCommand(loginCmd, runCmd)
-	rootCmd.Execute()
 }
