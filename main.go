@@ -99,7 +99,7 @@ func login(username, password string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("login failed with status: %s", resp.Status)
+		return fmt.Errorf("check your username and password")
 	}
 
 	var loginResp map[string]string
